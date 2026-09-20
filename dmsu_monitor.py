@@ -16,9 +16,9 @@ import telegram
 # ─────────────────────────────────────────────
 #  НАЛАШТУВАННЯ — заповни перед запуском
 # ─────────────────────────────────────────────
-TELEGRAM_TOKEN    = "8789172800:AAF8OGR6ktJx2Mv2ZwgfoTGdiY3K2vB7qf0"
+TELEGRAM_TOKEN    = ""
 TELEGRAM_CHAT_IDS = [
-    "346388164",       # дізнатись через @userinfobot у Telegram
+    "",       # дізнатись через @userinfobot у Telegram
     # "chat_id_дружини",  # додай ще якщо потрібно
 ]
 
