@@ -2,8 +2,8 @@ name: DMSU Monitor
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # кожні 5 хвилин
-  workflow_dispatch:          # або вручну з кнопки на GitHub
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   check-slots:
