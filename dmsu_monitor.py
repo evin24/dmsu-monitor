@@ -1,9 +1,14 @@
+
+
 """
 DMSU.gov.ua — Моніторинг вільних місць в електронній черзі
 
-Режими роботи:
-  - GitHub Actions: одна перевірка і завершення (запускається кожні 5 хв за розкладом)
-  - Локально:       нескінченний цикл з інтервалом CHECK_INTERVAL_SEC
+Особливості:
+  - Час синхронізовано з Києвом (Europe/Kyiv)
+  - З 23:00 до 00:30 за Києвом — перевірка кожну хвилину (час оновлення черги)
+  - З 00:30 до 23:00 — перевірка кожні 5 хвилин
+  - Помилка 500 (техобслуговування 21:00-00:01 UTC) — мовчки пропускається
+  - Перший запит після відновлення (00:01 Київ) завжди з актуальною датою
 
 Залежності:
     pip install requests python-telegram-bot
@@ -13,36 +18,43 @@ import asyncio
 import logging
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 import telegram
 
-# ─────────────────────────────────────────────
-#  НАЛАШТУВАННЯ
-#  Локально: заповни тут
-#  GitHub Actions: заповни в Secrets (Settings → Secrets → Actions)
-# ─────────────────────────────────────────────
+# ── Часовий пояс Києва ───────────────────────────────────────────────────────
+try:
+    from zoneinfo import ZoneInfo
+    KYIV_TZ = ZoneInfo("Europe/Kyiv")
+except ImportError:
+    KYIV_TZ = timezone(timedelta(hours=3))
+
+def now_kyiv() -> datetime:
+    return datetime.now(KYIV_TZ)
+
+# ── Налаштування ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "123456789:AAxxxx...")
 
-# Для GitHub Actions: в Secrets вкажи як JSON рядок: ["111","222"]
-# Локально: просто заповни список нижче
 _chat_ids_env = os.environ.get("TELEGRAM_CHAT_IDS", "")
 if _chat_ids_env:
     TELEGRAM_CHAT_IDS = json.loads(_chat_ids_env)
 else:
     TELEGRAM_CHAT_IDS = [
         "твій_chat_id",
-        # "chat_id_дружини",
     ]
-
-CHECK_INTERVAL_SEC = 300   # лише для локального запуску (5 хвилин)
 
 # Параметри API
 SUBDIVISION_ID = 17   # Деснянський відділ ЦМУ ДМС м. Київ
 SERVICE_ID     = 5    # Паспорт для виїзду за кордон
 DAYS_AHEAD     = 60   # перевіряти на 2 місяці вперед
-# ─────────────────────────────────────────────
+
+# Інтервали перевірки
+INTERVAL_NORMAL  = 300   # 5 хвилин — звичайний час
+INTERVAL_NIGHT   = 60    # 1 хвилина — нічний час (оновлення черги)
+NIGHT_START_HOUR = 23    # з 23:00 за Києвом
+NIGHT_END_HOUR   = 1     # до 01:00 за Києвом
+# ─────────────────────────────────────────────────────────────────────────────
 
 API_URL     = f"https://cherga.dmsu.gov.ua/api/v1/days/{SUBDIVISION_ID}/{SERVICE_ID}"
 BOOKING_URL = "https://dmsu.gov.ua/services/online.html"
@@ -72,15 +84,31 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def get_interval() -> int:
+    """
+    Повертає інтервал перевірки залежно від часу за Києвом:
+      23:00 – 01:00 → кожну хвилину (черга оновлюється опівночі)
+      решта часу    → кожні 5 хвилин
+    """
+    hour = now_kyiv().hour
+    if hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR:
+        return INTERVAL_NIGHT
+    return INTERVAL_NORMAL
+
+
 def fmt_date(d: str) -> str:
     """2026-10-15 → 15 жовтня 2026"""
     y, m, day = d.split("-")
     return f"{int(day)} {MONTH_UA.get(m, m)} {y}"
 
 
-def fetch_free_days() -> list[str]:
-    """Один запит до API, повертає список вільних дат."""
-    today = datetime.now()
+def fetch_free_days() -> tuple[list[str], bool]:
+    """
+    Запит до API.
+    Повертає (список_вільних_дат, успішно).
+    При помилці 500 повертає ([], False) — скрипт мовчить і чекає.
+    """
+    today = now_kyiv()
     end   = today + timedelta(days=DAYS_AHEAD)
     params = {
         "startDate": today.strftime("%Y-%m-%d"),
@@ -88,13 +116,20 @@ def fetch_free_days() -> list[str]:
     }
     try:
         r = requests.get(API_URL, params=params, headers=HEADERS, timeout=15)
+
+        # 500 = техобслуговування (21:00-00:01 UTC) — мовчки пропускаємо
+        if r.status_code == 500:
+            log.warning("⚙  Сервер на обслуговуванні (500) — чекаємо відновлення…")
+            return [], False
+
         r.raise_for_status()
         days = r.json().get("data", [])
-        log.info(f"API: {len(days)} вільних дат")
-        return days
-    except Exception as e:
+        log.info(f"API: {len(days)} вільних дат ({params['startDate']} → {params['endDate']})")
+        return days, True
+
+    except requests.RequestException as e:
         log.error(f"Помилка API: {e}")
-        return []
+        return [], False
 
 
 async def send_telegram(bot: telegram.Bot, message: str) -> None:
@@ -111,46 +146,50 @@ async def send_telegram(bot: telegram.Bot, message: str) -> None:
             log.error(f"Помилка Telegram для {chat_id}: {e}")
 
 
-async def run_once() -> None:
-    """Одна перевірка — для GitHub Actions."""
-    bot = telegram.Bot(token=TELEGRAM_TOKEN)
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
-
-    free_days = fetch_free_days()
-
-    if free_days:
-        day_list = "\n".join(f"  📅 {fmt_date(d)}" for d in sorted(free_days))
-        await send_telegram(
-            bot,
-            f"🟢 <b>З'явились вільні місця на запис до ДМСУ!</b>\n\n"
-            f"{day_list}\n\n"
-            f"👉 <a href='{BOOKING_URL}'>Записатись зараз!</a>\n"
-            f"🕐 {now}"
-        )
-    else:
-        log.info("Вільних місць немає — тихо завершуємо.")
-
-
 async def run_loop() -> None:
-    """Нескінченний цикл — для локального запуску."""
+    """Нескінченний цикл для Railway."""
     bot = telegram.Bot(token=TELEGRAM_TOKEN)
+    now = now_kyiv().strftime("%d.%m.%Y %H:%M")
 
     await send_telegram(
         bot,
-        "🤖 <b>Моніторинг ДМСУ запущено (локально)</b>\n"
-        f"⏱ Перевірка кожні {CHECK_INTERVAL_SEC // 60} хв."
+        "🤖 <b>Моніторинг ДМСУ запущено</b>\n"
+        f"📍 Деснянський відділ ЦМУ ДМС м. Київ\n"
+        f"📄 Паспорт для виїзду за кордон\n"
+        f"🕐 {now} (час Київ)\n\n"
+        "Вночі (23:00–01:00) перевірка щохвилини.\n"
+        "Решту часу — кожні 5 хвилин."
     )
 
     last_notified: set[str] = set()
     check_count = 0
+    was_maintenance = False  # флаг: чи були на обслуговуванні
 
     while True:
         check_count += 1
-        now = datetime.now().strftime("%d.%m.%Y %H:%M")
-        log.info(f"─── Перевірка #{check_count} | {now} ───")
+        now  = now_kyiv().strftime("%d.%m.%Y %H:%M")
+        hour = now_kyiv().hour
+        interval = get_interval()
 
-        free_days = fetch_free_days()
-        new_days  = set(free_days) - last_notified
+        log.info(
+            f"─── Перевірка #{check_count} | {now} Київ | "
+            f"інтервал: {interval//60} хв ───"
+        )
+
+        free_days, success = fetch_free_days()
+
+        if not success:
+            # Сервер на обслуговуванні — чекаємо мовчки
+            was_maintenance = True
+            await asyncio.sleep(interval)
+            continue
+
+        # Щойно відновились після обслуговування — повідомимо
+        if was_maintenance:
+            log.info("✅ Сервер відновлено після обслуговування.")
+            was_maintenance = False
+
+        new_days = set(free_days) - last_notified
 
         if new_days:
             day_list = "\n".join(f"  📅 {fmt_date(d)}" for d in sorted(new_days))
@@ -159,7 +198,7 @@ async def run_loop() -> None:
                 f"🟢 <b>З'явились вільні місця на запис до ДМСУ!</b>\n\n"
                 f"{day_list}\n\n"
                 f"👉 <a href='{BOOKING_URL}'>Записатись зараз!</a>\n"
-                f"🕐 {now}"
+                f"🕐 {now} (Київ)"
             )
             last_notified = set(free_days)
         else:
@@ -167,14 +206,19 @@ async def run_loop() -> None:
             if not free_days:
                 last_notified.clear()
 
-        await asyncio.sleep(CHECK_INTERVAL_SEC)
+        # Щогодинний статус
+        if check_count % max(1, 3600 // interval) == 0:
+            status = f"🟢 є {len(free_days)} вільних дат" if free_days else "⛔ вільних місць немає"
+            await send_telegram(
+                bot,
+                f"🔄 <b>Моніторинг активний</b>\n"
+                f"Перевірок: {check_count} | {status}\n"
+                f"🕐 {now} (Київ)"
+            )
+
+        await asyncio.sleep(interval)
 
 
 if __name__ == "__main__":
-    # Визначаємо режим: GitHub Actions встановлює змінну GITHUB_ACTIONS=true
-    if os.environ.get("GITHUB_ACTIONS") == "true":
-        log.info("Режим: GitHub Actions (одна перевірка)")
-        asyncio.run(run_once())
-    else:
-        log.info("Режим: локальний (нескінченний цикл)")
-        asyncio.run(run_loop())
+    log.info("Запуск моніторингу ДМСУ (Railway)…")
+    asyncio.run(run_loop())
