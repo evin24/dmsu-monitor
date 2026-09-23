@@ -7,12 +7,14 @@ DMSU.gov.ua — Моніторинг вільних місць в електро
   - Нічне вікно 23:00–02:00 за Києвом — перевірка кожну хвилину
   - Вдень 02:00–23:00 — перевірка кожні 5 хвилин
   - Асинхронний HTTP-запит (не блокує event loop)
+  - Стійкість до помилок API та зміни формату даних
 """
 
 import asyncio
 import logging
 import os
 import json
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -137,9 +139,17 @@ async def fetch_free_days() -> tuple[list[str], bool]:
             if not isinstance(days, list):
                 log.warning(f"Несподіваний формат data: {type(days).__name__}")
                 days = []
+                
+            # Очищуємо дані: якщо це словник, беремо значення 'date', інакше залишаємо як текст
+            clean_days = []
+            for d in days:
+                if isinstance(d, dict) and "date" in d:
+                    clean_days.append(d["date"])
+                else:
+                    clean_days.append(str(d))
 
-            log.info(f"API: {len(days)} вільних дат ({params['startDate']} → {params['endDate']})")
-            return days, True
+            log.info(f"API: {len(clean_days)} вільних дат ({params['startDate']} → {params['endDate']})")
+            return clean_days, True
 
         except requests.RequestException as e:
             last_err = e
@@ -192,58 +202,63 @@ async def run_loop() -> None:
     was_maintenance = False
 
     while True:
-        check_count += 1
-        now = now_kyiv().strftime("%d.%m.%Y %H:%M")
         interval = get_interval()
+        now = now_kyiv().strftime("%d.%m.%Y %H:%M")
+        
+        try:
+            check_count += 1
+            log.info(f"─── Перевірка #{check_count} | {now} Київ | інтервал: {interval} с ───")
 
-        log.info(f"─── Перевірка #{check_count} | {now} Київ | інтервал: {interval} с ───")
+            free_days, success = await fetch_free_days()
 
-        free_days, success = await fetch_free_days()
+            if not success:
+                was_maintenance = True
+            else:
+                if was_maintenance:
+                    log.info("✅ Сервер відновлено після обслуговування.")
+                    await send_telegram(
+                        bot,
+                        f"✅ <b>Сервер ДМСУ знову доступний</b>\n"
+                        f"Продовжую моніторинг.\n"
+                        f"🕐 {now} (Київ)"
+                    )
+                    was_maintenance = False
 
-        if not success:
-            was_maintenance = True
-            await asyncio.sleep(interval)
-            continue
+                current = set(free_days)
+                new_days = current - last_notified
 
-        if was_maintenance:
-            log.info("✅ Сервер відновлено після обслуговування.")
-            await send_telegram(
-                bot,
-                f"✅ <b>Сервер ДМСУ знову доступний</b>\n"
-                f"Продовжую моніторинг.\n"
-                f"🕐 {now} (Київ)"
-            )
-            was_maintenance = False
+                if new_days:
+                    day_list = "\n".join(f"  📅 {fmt_date(d)}" for d in sorted(new_days))
+                    await send_telegram(
+                        bot,
+                        "🟢 <b>З'явились вільні місця на запис до ДМСУ!</b>\n\n"
+                        f"{day_list}\n\n"
+                        f"👉 <a href='{BOOKING_URL}'>Записатись зараз!</a>\n"
+                        f"🕐 {now} (Київ)"
+                    )
+                    last_notified |= current
+                else:
+                    log.info("Вільних місць немає.")
 
-        current = set(free_days)
-        new_days = current - last_notified
+                if not current:
+                    last_notified.clear()
 
-        if new_days:
-            day_list = "\n".join(f"  📅 {fmt_date(d)}" for d in sorted(new_days))
-            await send_telegram(
-                bot,
-                "🟢 <b>З'явились вільні місця на запис до ДМСУ!</b>\n\n"
-                f"{day_list}\n\n"
-                f"👉 <a href='{BOOKING_URL}'>Записатись зараз!</a>\n"
-                f"🕐 {now} (Київ)"
-            )
-            last_notified |= current
-        else:
-            log.info("Вільних місць немає.")
+                cycles_per_hour = max(1, 3600 // interval)
+                if check_count % cycles_per_hour == 0:
+                    status = f"🟢 є {len(free_days)} вільних дат" if free_days else "⛔ вільних місць немає"
+                    await send_telegram(
+                        bot,
+                        "🔄 <b>Моніторинг активний</b>\n"
+                        f"Перевірок: {check_count} | {status}\n"
+                        f"🕐 {now} (Київ)"
+                    )
 
-        if not current:
-            last_notified.clear()
+        except Exception as e:
+            # Захист від падіння всього скрипта
+            log.error(f"Помилка під час перевірки: {e}")
+            log.debug(traceback.format_exc())
 
-        cycles_per_hour = max(1, 3600 // interval)
-        if check_count % cycles_per_hour == 0:
-            status = f"🟢 є {len(free_days)} вільних дат" if free_days else "⛔ вільних місць немає"
-            await send_telegram(
-                bot,
-                "🔄 <b>Моніторинг активний</b>\n"
-                f"Перевірок: {check_count} | {status}\n"
-                f"🕐 {now} (Київ)"
-            )
-
+        # Завжди чекаємо інтервал перед наступною перевіркою, навіть якщо була помилка
         await asyncio.sleep(interval)
 
 if __name__ == "__main__":
